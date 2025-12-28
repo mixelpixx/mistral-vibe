@@ -67,10 +67,78 @@ This document tracks improvements and bug fixes implemented in this fork that ad
 
 ---
 
-### 🔄 #191 - Custom Slash Commands Support
-**Status:** Planned
+### ✅ Fixed #191 - Custom Slash Commands Support
+**Status:** Fixed
 **Upstream Issue:** https://github.com/mistralai/mistral-vibe/issues/191
-**Description:** Add support for user-defined custom slash commands for better integration and extensibility.
+**Problem:** Users wanted the ability to define custom slash commands to extend Vibe with project-specific or frequently-used commands without modifying the source code.
+
+**Our Implementation:**
+- **TOML-based configuration**: Custom commands are defined in `~/.vibe/commands/*.toml` files
+- **Two command types**:
+  - `bash`: Execute shell commands in the current working directory
+  - `prompt`: Insert pre-written prompt templates into the conversation
+- **Flexible aliases**: Each command can have multiple aliases (e.g., `/test`, `/t`)
+- **Auto-loading**: Commands are automatically loaded at startup
+- **Help integration**: Custom commands appear in `/help` output under "Custom Commands" section
+- **Example commands included**: test, review, gitstatus
+
+**Files Created:**
+- `vibe/core/custom_commands.py` (201 lines)
+  - `CustomCommandDefinition` dataclass
+  - `CustomCommandLoader` class for loading commands from TOML files
+  - `CustomCommandExecutor` class for executing bash and prompt commands
+  - `create_custom_command_handler()` factory function
+
+**Files Modified:**
+- `vibe/cli/commands.py`
+  - Added `is_custom` field to `Command` dataclass
+  - Added `commands_dir` parameter to `CommandRegistry.__init__()`
+  - Added `_load_custom_commands()` method
+  - Updated `get_help_text()` to separate built-in and custom commands
+
+- `vibe/cli/textual_ui/app.py`
+  - Added custom command loader and executor initialization
+  - Added `_handle_custom_command()` method
+  - Updated `_handle_command()` to route custom commands correctly
+  - Added UI integration for bash output and prompt submission
+
+**Documentation:**
+- `docs/custom-commands.md` (298 lines)
+  - Quick start guide
+  - Command format reference
+  - Examples for common use cases
+  - Best practices and troubleshooting
+
+**Example Command (Test Suite):**
+```toml
+[command]
+name = "test"
+aliases = ["/test", "/t"]
+description = "Run the project's test suite"
+type = "bash"
+command = "pytest tests/ -v"
+```
+
+**Example Command (Code Review Prompt):**
+```toml
+[command]
+name = "review"
+aliases = ["/review", "/r"]
+description = "Request a code review"
+type = "prompt"
+template = '''Please review the changes I just made. Focus on:
+1. Code quality and best practices
+2. Potential bugs or edge cases
+3. Performance considerations
+4. Security implications'''
+```
+
+**Technical Details:**
+- Commands are loaded from `~/.vibe/commands/` using `tomli` TOML parser
+- Bash commands execute with `/bin/bash` in the project working directory
+- Prompt commands are submitted as user messages, triggering agent response
+- 30-second timeout for bash commands (configurable in future)
+- Error handling prevents single bad command from breaking entire system
 
 ---
 
