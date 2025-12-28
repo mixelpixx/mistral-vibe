@@ -59,6 +59,7 @@ uv run vibe --help
 - **Multi-Provider Support**: Use Mistral AI, local LLMs, or third-party cloud providers with a unified interface.
 - **Interactive Chat**: A conversational AI agent that understands your requests and breaks down complex tasks.
 - **Powerful Toolset**: A suite of tools for file manipulation, code searching, version control, and command execution.
+- **Custom Slash Commands**: Extend Vibe with your own commands - execute bash scripts or insert prompt templates.
 - **Full MCP Protocol**: Complete Model Context Protocol support including tools, resources, and prompts.
 - **Project-Aware Context**: Automatic scanning of project structure and Git status for relevant context.
 - **Advanced CLI Experience**: Autocompletion, persistent history, beautiful themes.
@@ -251,6 +252,30 @@ Use slash commands during a session for meta-actions:
 | `/compact` | Summarize and compact conversation |
 | `/quit` | Exit the session |
 
+### Custom Slash Commands
+
+Create your own slash commands to extend Vibe! Custom commands can execute bash scripts or insert prompt templates. See the [Custom Commands Documentation](docs/custom-commands.md) for details.
+
+**Quick Example:**
+```bash
+# Create the commands directory
+mkdir -p ~/.vibe/commands
+
+# Create a test command
+cat > ~/.vibe/commands/test.toml << 'EOF'
+[command]
+name = "test"
+aliases = ["/test", "/t"]
+description = "Run the project's test suite"
+type = "bash"
+command = "pytest tests/ -v"
+EOF
+
+# Use it in Vibe
+vibe
+> /test
+```
+
 ## Configuration
 
 Vibe uses a `config.toml` file located at `~/.vibe/config.toml` (or `./.vibe/config.toml` for project-specific config).
@@ -436,23 +461,25 @@ This fork adds the following features to the upstream Mistral Vibe:
 
 3. **Provider Selection in Onboarding**: The setup wizard now includes provider selection.
 
-4. **New Tools**:
+4. **Custom Slash Commands**: User-defined commands for bash scripts and prompt templates (see [docs/custom-commands.md](docs/custom-commands.md)).
+
+5. **New Tools**:
    - `glob`: Find files by pattern (`**/*.py`, `src/**/*.ts`)
    - `list_directory`: List directory contents with size/date metadata
    - `web_fetch`: Fetch and extract content from URLs
 
-5. **Full MCP Protocol Support**:
+6. **Full MCP Protocol Support**:
    - Resources: Read data exposed by MCP servers
    - Resource Templates: Dynamic resource URI patterns
    - Prompts: Reusable prompt templates with arguments
    - `mcp_read_resource` tool for LLM to access MCP resources
    - `mcp_get_prompt` tool for LLM to retrieve MCP prompts
 
-6. **New Slash Commands**:
+7. **New Slash Commands**:
    - `/cost`: Display token usage and estimated cost for the session
    - `/mcp`: Show all MCP servers with their tools, resources, and prompts
 
-7. **Generic Backend Improvements**: Better handling of non-Mistral API responses (finish_reason, tool call index fields).
+8. **Generic Backend Improvements**: Better handling of non-Mistral API responses (finish_reason, tool call index fields).
 
 ## Bug Fixes in This Fork
 
@@ -465,6 +492,8 @@ This fork includes fixes for critical upstream bugs:
 3. **✅ Fixed #186 - Bash Tool**: The bash tool now correctly uses `/bin/bash` instead of `/bin/sh`, enabling bash-specific features like the `source` command.
 
 4. **✅ Fixed #218 - API Key Validation (Enhanced)**: Validates API keys during setup for ALL providers (Mistral, OpenAI, Groq, Together, OpenRouter), not just Mistral. Includes network error handling and skip option for offline setups. This is an improved version of upstream PR #219 which only worked for Mistral.
+
+5. **✅ Fixed #191 - Custom Slash Commands**: Implemented user-defined custom slash commands for executing bash scripts and inserting prompt templates. Commands are configured via TOML files in `~/.vibe/commands/`.
 
 For detailed information about each fix, see [IMPROVEMENTS.md](IMPROVEMENTS.md).
 
