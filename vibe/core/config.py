@@ -19,43 +19,20 @@ from pydantic_settings import (
 )
 import tomli_w
 
+from vibe.core.paths.config_paths import AGENT_DIR, CONFIG_DIR, CONFIG_FILE, PROMPT_DIR
+from vibe.core.paths.global_paths import GLOBAL_ENV_FILE, SESSION_LOG_DIR
 from vibe.core.prompts import SystemPrompt
 from vibe.core.tools.base import BaseToolConfig
 
-
-def get_vibe_home() -> Path:
-    if vibe_home := os.getenv("VIBE_HOME"):
-        return Path(vibe_home).expanduser().resolve()
-    return Path.home() / ".vibe"
-
-
-GLOBAL_CONFIG_DIR = get_vibe_home()
-GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.toml"
-GLOBAL_ENV_FILE = GLOBAL_CONFIG_DIR / ".env"
-
-
-def resolve_config_file() -> Path:
-    for directory in (cwd := Path.cwd(), *cwd.parents):
-        if (candidate := directory / ".vibe" / "config.toml").is_file():
-            return candidate
-    return GLOBAL_CONFIG_FILE
+PROJECT_DOC_FILENAMES = ["AGENTS.md", "VIBE.md", ".vibe.md"]
 
 
 def load_api_keys_from_env() -> None:
-    if GLOBAL_ENV_FILE.is_file():
-        env_vars = dotenv_values(GLOBAL_ENV_FILE)
+    if GLOBAL_ENV_FILE.path.is_file():
+        env_vars = dotenv_values(GLOBAL_ENV_FILE.path)
         for key, value in env_vars.items():
             if value:
                 os.environ.setdefault(key, value)
-
-
-CONFIG_FILE = resolve_config_file()
-CONFIG_DIR = CONFIG_FILE.parent
-AGENT_DIR = CONFIG_DIR / "agents"
-PROMPT_DIR = CONFIG_DIR / "prompts"
-INSTRUCTIONS_FILE = CONFIG_DIR / "instructions.md"
-HISTORY_FILE = CONFIG_DIR / "vibehistory"
-PROJECT_DOC_FILENAMES = ["AGENTS.md", "VIBE.md", ".vibe.md"]
 
 
 class MissingAPIKeyError(RuntimeError):
@@ -94,7 +71,7 @@ class TomlFileSettingsSource(PydanticBaseSettingsSource):
         self.toml_data = self._load_toml()
 
     def _load_toml(self) -> dict[str, Any]:
-        file = CONFIG_FILE
+        file = CONFIG_FILE.path
         try:
             with file.open("rb") as f:
                 return tomllib.load(f)
@@ -134,7 +111,7 @@ class SessionLoggingConfig(BaseSettings):
     @classmethod
     def set_default_save_dir(cls, v: str) -> str:
         if not v:
-            return str(get_vibe_home() / "logs" / "session")
+            return str(SESSION_LOG_DIR.path)
         return v
 
     @field_validator("save_dir", mode="after")
@@ -154,6 +131,7 @@ class ProviderConfig(BaseModel):
     api_key_env_var: str = ""
     api_style: str = "openai"
     backend: Backend = Backend.GENERIC
+    reasoning_field_name: str = "reasoning_content"
 
 
 class _MCPBase(BaseModel):
@@ -296,12 +274,12 @@ DEFAULT_MODELS = [
 
 class VibeConfig(BaseSettings):
     active_model: str = "devstral-2"
+    textual_theme: str = "terminal"
     vim_keybindings: bool = False
     disable_welcome_banner_animation: bool = False
     displayed_workdir: str = ""
     auto_compact_threshold: int = 200_000
     context_warnings: bool = False
-    textual_theme: str = "textual-dark"
     instructions: str = ""
     workdir: Path | None = Field(default=None, exclude=True)
     system_prompt_id: str = "cli"
@@ -319,7 +297,7 @@ class VibeConfig(BaseSettings):
     project_context: ProjectContextConfig = Field(default_factory=ProjectContextConfig)
     session_logging: SessionLoggingConfig = Field(default_factory=SessionLoggingConfig)
     tools: dict[str, BaseToolConfig] = Field(default_factory=dict)
-    tool_paths: list[str] = Field(
+    tool_paths: list[Path] = Field(
         default_factory=list,
         description=(
             "Additional directories to search for custom tools. "
@@ -349,8 +327,16 @@ class VibeConfig(BaseSettings):
         ),
     )
 
+    skill_paths: list[Path] = Field(
+        default_factory=list,
+        description=(
+            "Additional directories to search for skills. "
+            "Each path may be absolute or relative to the current working directory."
+        ),
+    )
+
     model_config = SettingsConfigDict(
-        env_prefix="VIBE_", case_sensitive=False, extra="forbid"
+        env_prefix="VIBE_", case_sensitive=False, extra="ignore"
     )
 
     @property
@@ -364,9 +350,9 @@ class VibeConfig(BaseSettings):
         except KeyError:
             pass
 
-        custom_sp_path = (PROMPT_DIR / self.system_prompt_id).with_suffix(".md")
+        custom_sp_path = (PROMPT_DIR.path / self.system_prompt_id).with_suffix(".md")
         if not custom_sp_path.is_file():
-            raise MissingPromptFileError(self.system_prompt_id, str(PROMPT_DIR))
+            raise MissingPromptFileError(self.system_prompt_id, str(PROMPT_DIR.path))
         return custom_sp_path.read_text()
 
     def get_active_model(self) -> ModelConfig:
@@ -441,6 +427,20 @@ class VibeConfig(BaseSettings):
             pass
         return self
 
+    @field_validator("tool_paths", mode="before")
+    @classmethod
+    def _expand_tool_paths(cls, v: Any) -> list[Path]:
+        if not v:
+            return []
+        return [Path(p).expanduser().resolve() for p in v]
+
+    @field_validator("skill_paths", mode="before")
+    @classmethod
+    def _expand_skill_paths(cls, v: Any) -> list[Path]:
+        if not v:
+            return []
+        return [Path(p).expanduser().resolve() for p in v]
+
     @field_validator("workdir", mode="before")
     @classmethod
     def _expand_workdir(cls, v: Any) -> Path | None:
@@ -492,7 +492,7 @@ class VibeConfig(BaseSettings):
 
     @classmethod
     def save_updates(cls, updates: dict[str, Any]) -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_DIR.path.mkdir(parents=True, exist_ok=True)
         current_config = TomlFileSettingsSource(cls).toml_data
 
         def deep_merge(target: dict, source: dict) -> None:
@@ -522,7 +522,7 @@ class VibeConfig(BaseSettings):
 
     @classmethod
     def dump_config(cls, config: dict[str, Any]) -> None:
-        with CONFIG_FILE.open("wb") as f:
+        with CONFIG_FILE.path.open("wb") as f:
             tomli_w.dump(config, f)
 
     @classmethod
@@ -530,36 +530,17 @@ class VibeConfig(BaseSettings):
         if agent is None:
             return None
 
-        agent_config_path = (AGENT_DIR / agent).with_suffix(".toml")
+        agent_config_path = (AGENT_DIR.path / agent).with_suffix(".toml")
         try:
             return tomllib.load(agent_config_path.open("rb"))
         except FileNotFoundError:
             raise ValueError(
-                f"Config '{agent}.toml' for agent not found in {AGENT_DIR}"
+                f"Config '{agent}.toml' for agent not found in {AGENT_DIR.path}"
             )
 
     @classmethod
     def _migrate(cls) -> None:
-        if not CONFIG_FILE.exists():
-            return
-
-        try:
-            with CONFIG_FILE.open("rb") as f:
-                config = tomllib.load(f)
-        except (OSError, tomllib.TOMLDecodeError):
-            return
-
-        needs_save = False
-
-        if (
-            "auto_compact_threshold" not in config
-            or config["auto_compact_threshold"] == 100_000  # noqa: PLR2004
-        ):
-            config["auto_compact_threshold"] = 200_000
-            needs_save = True
-
-        if needs_save:
-            cls.dump_config(config)
+        pass
 
     @classmethod
     def load(cls, agent: str | None = None, **overrides: Any) -> VibeConfig:

@@ -13,18 +13,16 @@ class SnapshotTestAppWithConversation(BaseSnapshotTestApp):
     def __init__(self) -> None:
         config = default_config()
         fake_backend = FakeBackend(
-            results=[
-                mock_llm_chunk(
-                    content="I'm the Vibe agent and I'm ready to help.",
-                    prompt_tokens=10_000,
-                    completion_tokens=2_500,
-                )
-            ]
+            mock_llm_chunk(
+                content="I'm the Vibe agent and I'm ready to help.",
+                prompt_tokens=10_000,
+                completion_tokens=2_500,
+            )
         )
         super().__init__(config=config)
         self.agent = Agent(
             config,
-            auto_approve=self.auto_approve,
+            mode=self._current_agent_mode,
             enable_streaming=self.enable_streaming,
             backend=fake_backend,
         )

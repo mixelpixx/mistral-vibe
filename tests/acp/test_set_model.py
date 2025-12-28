@@ -17,13 +17,10 @@ from vibe.core.types import LLMChunk, LLMMessage, LLMUsage, Role
 @pytest.fixture
 def backend() -> FakeBackend:
     backend = FakeBackend(
-        results=[
-            LLMChunk(
-                message=LLMMessage(role=Role.assistant, content="Hi"),
-                finish_reason="end_turn",
-                usage=LLMUsage(prompt_tokens=1, completion_tokens=1),
-            )
-        ]
+        LLMChunk(
+            message=LLMMessage(role=Role.assistant, content="Hi"),
+            usage=LLMUsage(prompt_tokens=1, completion_tokens=1),
+        )
     )
     return backend
 
@@ -49,6 +46,8 @@ def acp_agent(backend: FakeBackend) -> VibeAcpAgent:
             ),
         ],
     )
+
+    VibeConfig.dump_config(config.model_dump())
 
     class PatchedAgent(Agent):
         def __init__(self, *args, **kwargs) -> None:

@@ -453,6 +453,10 @@ This fork adds the following features to the upstream Mistral Vibe:
 
 7. **Generic Backend Improvements**: Better handling of non-Mistral API responses (finish_reason, tool call index fields).
 
+## Editors/IDEs
+
+Mistral Vibe can be used in text editors and IDEs that support [Agent Client Protocol](https://agentclientprotocol.com/overview/clients). See the [ACP Setup documentation](docs/acp-setup.md) for setup instructions for various editors and IDEs.
+
 ## Resources
 
 - [CHANGELOG](CHANGELOG.md) - Version history

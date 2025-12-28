@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING
 from textual.widgets import Static
 
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
-from vibe.cli.textual_ui.widgets.messages import AssistantMessage
+from vibe.cli.textual_ui.widgets.messages import AssistantMessage, ReasoningMessage
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from vibe.core.types import (
     AssistantEvent,
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
+    ReasoningEvent,
     ToolCallEvent,
     ToolResultEvent,
 )
@@ -38,7 +39,6 @@ class EventHandler:
         self.get_todos_collapsed = get_todos_collapsed
         self.current_tool_call: ToolCallMessage | None = None
         self.current_compact: CompactMessage | None = None
-        self.tool_results: list[ToolResultMessage] = []
 
     async def handle_event(
         self,
@@ -51,21 +51,18 @@ class EventHandler:
                 return await self._handle_tool_call(event, loading_widget)
             case ToolResultEvent():
                 sanitized_event = self._sanitize_event(event)
-
                 await self._handle_tool_result(sanitized_event)
-                return None
+            case ReasoningEvent():
+                await self._handle_reasoning_message(event)
             case AssistantEvent():
                 await self._handle_assistant_message(event)
-                return None
             case CompactStartEvent():
                 await self._handle_compact_start()
-                return None
             case CompactEndEvent():
                 await self._handle_compact_end(event)
-                return None
             case _:
                 await self._handle_unknown_event(event)
-                return None
+        return None
 
     def _sanitize_event(self, event: ToolResultEvent) -> ToolResultEvent:
         if isinstance(event, ToolResultEvent):
@@ -121,11 +118,16 @@ class EventHandler:
             )
             await self.mount_callback(tool_result)
 
-        self.tool_results.append(tool_result)
         self.current_tool_call = None
 
     async def _handle_assistant_message(self, event: AssistantEvent) -> None:
         await self.mount_callback(AssistantMessage(event.content))
+
+    async def _handle_reasoning_message(self, event: ReasoningEvent) -> None:
+        tools_collapsed = self.get_tools_collapsed()
+        await self.mount_callback(
+            ReasoningMessage(event.content, collapsed=tools_collapsed)
+        )
 
     async def _handle_compact_start(self) -> None:
         compact_msg = CompactMessage()
@@ -146,13 +148,10 @@ class EventHandler:
 
     def stop_current_tool_call(self) -> None:
         if self.current_tool_call:
-            self.current_tool_call.stop_blinking()
+            self.current_tool_call.stop_spinning()
             self.current_tool_call = None
 
     def stop_current_compact(self) -> None:
         if self.current_compact:
-            self.current_compact.stop_blinking(success=False)
+            self.current_compact.stop_spinning(success=False)
             self.current_compact = None
-
-    def get_last_tool_result(self) -> ToolResultMessage | None:
-        return self.tool_results[-1] if self.tool_results else None

@@ -10,7 +10,6 @@ from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.core.agent import Agent
 from vibe.core.config import SessionLoggingConfig, VibeConfig
-from vibe.core.llm.types import BackendLike
 from vibe.core.middleware import (
     ConversationContext,
     MiddlewareAction,
@@ -18,23 +17,21 @@ from vibe.core.middleware import (
     MiddlewareResult,
     ResetReason,
 )
+from vibe.core.modes import AgentMode
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.tools.builtins.todo import TodoArgs
 from vibe.core.types import (
+    ApprovalResponse,
     AssistantEvent,
     FunctionCall,
-    LLMChunk,
     LLMMessage,
+    ReasoningEvent,
     Role,
     ToolCall,
     ToolCallEvent,
     ToolResultEvent,
 )
-from vibe.core.utils import (
-    ApprovalResponse,
-    CancellationReason,
-    get_user_cancellation_message,
-)
+from vibe.core.utils import CancellationReason, get_user_cancellation_message
 
 
 class InjectBeforeMiddleware:
@@ -148,23 +145,6 @@ async def test_act_emits_user_and_assistant_msgs(observer_capture) -> None:
 
 
 @pytest.mark.asyncio
-async def test_act_yields_assistant_event_with_usage_stats() -> None:
-    backend = FakeBackend([mock_llm_chunk(content="Pong!")])
-    agent = Agent(make_config(), backend=backend)
-
-    events = [ev async for ev in agent.act("Ping?")]
-
-    assert len(events) == 1
-    ev = events[-1]
-    assert isinstance(ev, AssistantEvent)
-    assert ev.content == "Pong!"
-    # stats come from tests.mock.utils.mock_llm_result (prompt=10, completion=5)
-    assert ev.prompt_tokens == 10
-    assert ev.completion_tokens == 5
-    assert ev.session_total_tokens == 15
-
-
-@pytest.mark.asyncio
 async def test_act_streams_batched_chunks_in_order() -> None:
     backend = FakeBackend([
         mock_llm_chunk(content="Hello"),
@@ -196,10 +176,11 @@ async def test_act_handles_streaming_with_tool_call_events_in_sequence() -> None
         function=FunctionCall(name="todo", arguments='{"action": "read"}'),
     )
     backend = FakeBackend([
-        mock_llm_chunk(content="Checking your todos."),
-        mock_llm_chunk(content="", tool_calls=[todo_tool_call]),
-        mock_llm_chunk(content="", finish_reason="stop"),
-        mock_llm_chunk(content="Done reviewing todos."),
+        [
+            mock_llm_chunk(content="Checking your todos."),
+            mock_llm_chunk(content="", tool_calls=[todo_tool_call]),
+        ],
+        [mock_llm_chunk(content="Done reviewing todos.")],
     ])
     agent = Agent(
         make_config(
@@ -207,7 +188,7 @@ async def test_act_handles_streaming_with_tool_call_events_in_sequence() -> None
             tools={"todo": BaseToolConfig(permission=ToolPermission.ALWAYS)},
         ),
         backend=backend,
-        auto_approve=True,
+        mode=AgentMode.AUTO_APPROVE,
         enable_streaming=True,
     )
 
@@ -241,7 +222,7 @@ async def test_act_handles_tool_call_chunk_with_content() -> None:
     backend = FakeBackend([
         mock_llm_chunk(content="Preparing "),
         mock_llm_chunk(content="todo request", tool_calls=[todo_tool_call]),
-        mock_llm_chunk(content=" complete", finish_reason="stop"),
+        mock_llm_chunk(content=" complete"),
     ])
     agent = Agent(
         make_config(
@@ -249,7 +230,7 @@ async def test_act_handles_tool_call_chunk_with_content() -> None:
             tools={"todo": BaseToolConfig(permission=ToolPermission.ALWAYS)},
         ),
         backend=backend,
-        auto_approve=True,
+        mode=AgentMode.AUTO_APPROVE,
         enable_streaming=True,
     )
 
@@ -257,14 +238,11 @@ async def test_act_handles_tool_call_chunk_with_content() -> None:
 
     assert [type(event) for event in events] == [
         AssistantEvent,
-        AssistantEvent,
         ToolCallEvent,
         ToolResultEvent,
     ]
     assert isinstance(events[0], AssistantEvent)
-    assert events[0].content == "Preparing todo request"
-    assert isinstance(events[1], AssistantEvent)
-    assert events[1].content == " complete"
+    assert events[0].content == "Preparing todo request complete"
     assert any(
         m.role == Role.assistant and m.content == "Preparing todo request complete"
         for m in agent.messages
@@ -294,7 +272,7 @@ async def test_act_merges_streamed_tool_call_arguments() -> None:
             tools={"todo": BaseToolConfig(permission=ToolPermission.ALWAYS)},
         ),
         backend=backend,
-        auto_approve=True,
+        mode=AgentMode.AUTO_APPROVE,
         enable_streaming=True,
     )
 
@@ -324,35 +302,6 @@ async def test_act_merges_streamed_tool_call_arguments() -> None:
 
 
 @pytest.mark.asyncio
-async def test_act_raises_when_stream_never_signals_finish() -> None:
-    class IncompleteStreamingBackend(BackendLike):
-        def __init__(self, chunks: list[LLMChunk]) -> None:
-            self._chunks = list(chunks)
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def complete_streaming(self, **_: object):
-            while self._chunks:
-                yield self._chunks.pop(0)
-
-        async def complete(self, **_: object):
-            return mock_llm_chunk(content="", finish_reason="stop")
-
-        async def count_tokens(self, **_: object) -> int:
-            return 0
-
-    backend = IncompleteStreamingBackend([mock_llm_chunk(content="partial")])
-    agent = Agent(make_config(), backend=backend, enable_streaming=True)
-
-    with pytest.raises(RuntimeError, match="Streamed completion returned no chunks"):
-        [event async for event in agent.act("Will this finish?")]
-
-
-@pytest.mark.asyncio
 async def test_act_handles_user_cancellation_during_streaming() -> None:
     class CountingMiddleware(MiddlewarePipeline):
         def __init__(self) -> None:
@@ -378,7 +327,6 @@ async def test_act_handles_user_cancellation_during_streaming() -> None:
     backend = FakeBackend([
         mock_llm_chunk(content="Preparing "),
         mock_llm_chunk(content="todo request", tool_calls=[todo_tool_call]),
-        mock_llm_chunk(content="", finish_reason="stop"),
     ])
     agent = Agent(
         make_config(
@@ -386,7 +334,7 @@ async def test_act_handles_user_cancellation_during_streaming() -> None:
             tools={"todo": BaseToolConfig(permission=ToolPermission.ASK)},
         ),
         backend=backend,
-        auto_approve=False,
+        mode=AgentMode.DEFAULT,
         enable_streaming=True,
     )
     middleware = CountingMiddleware()
@@ -412,7 +360,7 @@ async def test_act_handles_user_cancellation_during_streaming() -> None:
     assert events[-1].skipped is True
     assert events[-1].skip_reason is not None
     assert "<user_cancellation>" in events[-1].skip_reason
-    assert agent.interaction_logger.save_interaction.await_count == 2
+    assert agent.interaction_logger.save_interaction.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -429,3 +377,150 @@ async def test_act_flushes_and_logs_when_streaming_errors(observer_capture) -> N
 
     assert [role for role, _ in observed] == [Role.system, Role.user]
     assert agent.interaction_logger.save_interaction.await_count == 1
+
+
+def _snapshot_events(events: list) -> list[tuple[str, str]]:
+    return [
+        (type(e).__name__, e.content)
+        for e in events
+        if isinstance(e, (AssistantEvent, ReasoningEvent))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_buffer_yields_before_content_on_transition() -> None:
+    backend = FakeBackend([
+        mock_llm_chunk(content="", reasoning_content="Let me think"),
+        mock_llm_chunk(content="", reasoning_content=" about this"),
+        mock_llm_chunk(content="", reasoning_content=" problem..."),
+        mock_llm_chunk(content="The answer is 42."),
+    ])
+    agent = Agent(make_config(), backend=backend, enable_streaming=True)
+
+    events = [event async for event in agent.act("What's the answer?")]
+
+    assert _snapshot_events(events) == [
+        ("ReasoningEvent", "Let me think about this problem..."),
+        ("AssistantEvent", "The answer is 42."),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_buffer_yields_before_content_with_batching() -> None:
+    backend = FakeBackend([
+        mock_llm_chunk(content="", reasoning_content="Step 1"),
+        mock_llm_chunk(content="", reasoning_content=", Step 2"),
+        mock_llm_chunk(content="", reasoning_content=", Step 3"),
+        mock_llm_chunk(content="", reasoning_content=", Step 4"),
+        mock_llm_chunk(content="", reasoning_content=", Step 5"),  # Triggers batch
+        mock_llm_chunk(content="", reasoning_content=", Step 6"),
+        mock_llm_chunk(content="", reasoning_content=", Final"),
+        mock_llm_chunk(content="Done thinking!"),
+    ])
+    agent = Agent(make_config(), backend=backend, enable_streaming=True)
+
+    events = [event async for event in agent.act("Think step by step")]
+
+    assert _snapshot_events(events) == [
+        ("ReasoningEvent", "Step 1, Step 2, Step 3, Step 4, Step 5"),
+        ("ReasoningEvent", ", Step 6, Final"),
+        ("AssistantEvent", "Done thinking!"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_content_buffer_yields_before_reasoning_on_transition() -> None:
+    """When content is buffered and reasoning arrives, content yields first."""
+    backend = FakeBackend([
+        mock_llm_chunk(content="Starting the response"),
+        mock_llm_chunk(content=" here..."),
+        mock_llm_chunk(content="", reasoning_content="Wait, let me reconsider"),
+        mock_llm_chunk(content="", reasoning_content=" this approach..."),
+        mock_llm_chunk(content="Actually, the final answer."),
+    ])
+    agent = Agent(make_config(), backend=backend, enable_streaming=True)
+
+    events = [event async for event in agent.act("Give me an answer")]
+
+    assert _snapshot_events(events) == [
+        ("AssistantEvent", "Starting the response here..."),
+        ("ReasoningEvent", "Wait, let me reconsider this approach..."),
+        ("AssistantEvent", "Actually, the final answer."),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_interleaved_reasoning_content_preserves_order() -> None:
+    backend = FakeBackend([
+        mock_llm_chunk(content="", reasoning_content="Think 1"),
+        mock_llm_chunk(content="Answer 1 "),
+        mock_llm_chunk(content="", reasoning_content="Think 2"),
+        mock_llm_chunk(content="Answer 2 "),
+        mock_llm_chunk(content="", reasoning_content="Think 3"),
+        mock_llm_chunk(content="Answer 3"),
+    ])
+    agent = Agent(make_config(), backend=backend, enable_streaming=True)
+
+    events = [event async for event in agent.act("Interleaved test")]
+
+    assert _snapshot_events(events) == [
+        ("ReasoningEvent", "Think 1"),
+        ("AssistantEvent", "Answer 1 "),
+        ("ReasoningEvent", "Think 2"),
+        ("AssistantEvent", "Answer 2 "),
+        ("ReasoningEvent", "Think 3"),
+        ("AssistantEvent", "Answer 3"),
+    ]
+
+    assistant_msg = next(m for m in agent.messages if m.role == Role.assistant)
+    assert assistant_msg.reasoning_content == "Think 1Think 2Think 3"
+    assert assistant_msg.content == "Answer 1 Answer 2 Answer 3"
+
+
+@pytest.mark.asyncio
+async def test_only_reasoning_chunks_yields_reasoning_event() -> None:
+    backend = FakeBackend([
+        mock_llm_chunk(content="", reasoning_content="Just thinking..."),
+        mock_llm_chunk(content="", reasoning_content=" nothing to say yet."),
+    ])
+    agent = Agent(make_config(), backend=backend, enable_streaming=True)
+
+    events = [event async for event in agent.act("Silent thinking")]
+
+    assert _snapshot_events(events) == [
+        ("ReasoningEvent", "Just thinking... nothing to say yet.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_buffers_flush_in_correct_order() -> None:
+    backend = FakeBackend([
+        mock_llm_chunk(content="", reasoning_content="Final thought"),
+        mock_llm_chunk(content="Final words"),
+    ])
+    agent = Agent(make_config(), backend=backend, enable_streaming=True)
+
+    events = [event async for event in agent.act("End buffers test")]
+
+    assert _snapshot_events(events) == [
+        ("ReasoningEvent", "Final thought"),
+        ("AssistantEvent", "Final words"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_content_chunks_do_not_trigger_false_yields() -> None:
+    backend = FakeBackend([
+        mock_llm_chunk(content="", reasoning_content="Reasoning here"),
+        mock_llm_chunk(content=""),  # Empty content shouldn't flush reasoning
+        mock_llm_chunk(content="", reasoning_content=" more reasoning"),
+        mock_llm_chunk(content="Actual content"),
+    ])
+    agent = Agent(make_config(), backend=backend, enable_streaming=True)
+
+    events = [event async for event in agent.act("Empty content test")]
+
+    assert _snapshot_events(events) == [
+        ("ReasoningEvent", "Reasoning here more reasoning"),
+        ("AssistantEvent", "Actual content"),
+    ]

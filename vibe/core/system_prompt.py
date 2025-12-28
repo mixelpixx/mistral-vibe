@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 import fnmatch
+import html
 import os
 from pathlib import Path
 import subprocess
@@ -9,19 +10,21 @@ import sys
 import time
 from typing import TYPE_CHECKING
 
-from vibe.core.config import INSTRUCTIONS_FILE, PROJECT_DOC_FILENAMES
+from vibe.core.config import PROJECT_DOC_FILENAMES
 from vibe.core.llm.format import get_active_tool_classes
+from vibe.core.paths.config_paths import INSTRUCTIONS_FILE
 from vibe.core.prompts import UtilityPrompt
 from vibe.core.utils import is_dangerous_directory, is_windows
 
 if TYPE_CHECKING:
     from vibe.core.config import ProjectContextConfig, VibeConfig
+    from vibe.core.skills.manager import SkillManager
     from vibe.core.tools.manager import ToolManager
 
 
 def _load_user_instructions() -> str:
     try:
-        return INSTRUCTIONS_FILE.read_text("utf-8", errors="ignore")
+        return INSTRUCTIONS_FILE.path.read_text("utf-8", errors="ignore")
     except (FileNotFoundError, OSError):
         return ""
 
@@ -374,7 +377,42 @@ def _add_commit_signature() -> str:
     )
 
 
-def get_universal_system_prompt(tool_manager: ToolManager, config: VibeConfig) -> str:
+def _get_available_skills_section(skill_manager: SkillManager | None) -> str:
+    if skill_manager is None:
+        return ""
+
+    skills = skill_manager.available_skills
+    if not skills:
+        return ""
+
+    lines = [
+        "# Available Skills",
+        "",
+        "You have access to the following skills. When a task matches a skill's description,",
+        "read the full SKILL.md file to load detailed instructions.",
+        "",
+        "<available_skills>",
+    ]
+
+    for name, info in sorted(skills.items()):
+        lines.append("  <skill>")
+        lines.append(f"    <name>{html.escape(str(name))}</name>")
+        lines.append(
+            f"    <description>{html.escape(str(info.description))}</description>"
+        )
+        lines.append(f"    <path>{html.escape(str(info.skill_path))}</path>")
+        lines.append("  </skill>")
+
+    lines.append("</available_skills>")
+
+    return "\n".join(lines)
+
+
+def get_universal_system_prompt(
+    tool_manager: ToolManager,
+    config: VibeConfig,
+    skill_manager: SkillManager | None = None,
+) -> str:
     sections = [config.system_prompt]
 
     if config.include_commit_signature:
@@ -396,6 +434,10 @@ def get_universal_system_prompt(tool_manager: ToolManager, config: VibeConfig) -
         user_instructions = config.instructions.strip() or _load_user_instructions()
         if user_instructions.strip():
             sections.append(user_instructions)
+
+        skills_section = _get_available_skills_section(skill_manager)
+        if skills_section:
+            sections.append(skills_section)
 
     if config.include_project_context:
         is_dangerous, reason = is_dangerous_directory()

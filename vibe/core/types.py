@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+import copy
 from enum import StrEnum, auto
 from typing import Annotated, Any, Literal
 
@@ -16,22 +17,6 @@ from pydantic import (
 )
 
 from vibe.core.tools.base import BaseTool
-
-
-@dataclass
-class ResumeSessionInfo:
-    type: Literal["continue", "resume"]
-    session_id: str
-    session_time: str
-
-    def message(self) -> str:
-        action = None
-        match self.type:
-            case "continue":
-                action = "Continuing"
-            case "resume":
-                action = "Resuming"
-        return f"{action} session `{self.session_id}` from {self.session_time}"
 
 
 class AgentStats(BaseModel):
@@ -173,11 +158,17 @@ class Role(StrEnum):
     tool = auto()
 
 
+class ApprovalResponse(StrEnum):
+    YES = "y"
+    NO = "n"
+
+
 class LLMMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     role: Role
     content: Content | None = None
+    reasoning_content: Content | None = None
     tool_calls: list[ToolCall] | None = None
     name: str | None = None
     tool_call_id: str | None = None
@@ -192,10 +183,62 @@ class LLMMessage(BaseModel):
         return {
             "role": str(getattr(v, "role", "assistant")),
             "content": getattr(v, "content", ""),
+            "reasoning_content": getattr(v, "reasoning_content", None),
             "tool_calls": getattr(v, "tool_calls", None),
             "name": getattr(v, "name", None),
             "tool_call_id": getattr(v, "tool_call_id", None),
         }
+
+    def __add__(self, other: LLMMessage) -> LLMMessage:
+        """Careful: this is not commutative!"""
+        if self.role != other.role:
+            raise ValueError("Can't accumulate messages with different roles")
+
+        if self.name != other.name:
+            raise ValueError("Can't accumulate messages with different names")
+
+        if self.tool_call_id != other.tool_call_id:
+            raise ValueError("Can't accumulate messages with different tool_call_ids")
+
+        content = (self.content or "") + (other.content or "")
+        if not content:
+            content = None
+
+        reasoning_content = (self.reasoning_content or "") + (
+            other.reasoning_content or ""
+        )
+        if not reasoning_content:
+            reasoning_content = None
+
+        tool_calls_map = OrderedDict[int, ToolCall]()
+        for tool_calls in [self.tool_calls or [], other.tool_calls or []]:
+            for tc in tool_calls:
+                if tc.index is None:
+                    raise ValueError("Tool call chunk missing index")
+                if tc.index not in tool_calls_map:
+                    tool_calls_map[tc.index] = copy.deepcopy(tc)
+                else:
+                    existing_name = tool_calls_map[tc.index].function.name
+                    new_name = tc.function.name
+                    if existing_name and new_name and existing_name != new_name:
+                        raise ValueError(
+                            "Can't accumulate messages with different tool call names"
+                        )
+                    if new_name and not existing_name:
+                        tool_calls_map[tc.index].function.name = new_name
+                    new_args = (tool_calls_map[tc.index].function.arguments or "") + (
+                        tc.function.arguments or ""
+                    )
+                    tool_calls_map[tc.index].function.arguments = new_args
+
+        return LLMMessage(
+            role=self.role,
+            content=content,
+            reasoning_content=reasoning_content,
+            tool_calls=list(tool_calls_map.values()) or None,
+            name=self.name,
+            tool_call_id=self.tool_call_id,
+        )
 
 
 class LLMUsage(BaseModel):
@@ -203,12 +246,24 @@ class LLMUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
+    def __add__(self, other: LLMUsage) -> LLMUsage:
+        return LLMUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+        )
+
 
 class LLMChunk(BaseModel):
     model_config = ConfigDict(frozen=True)
     message: LLMMessage
-    finish_reason: str | None = None
     usage: LLMUsage | None = None
+
+    def __add__(self, other: LLMChunk) -> LLMChunk:
+        if self.usage is None and other.usage is None:
+            new_usage = None
+        else:
+            new_usage = (self.usage or LLMUsage()) + (other.usage or LLMUsage())
+        return LLMChunk(message=self.message + other.message, usage=new_usage)
 
 
 class BaseEvent(BaseModel, ABC):
@@ -219,12 +274,18 @@ class BaseEvent(BaseModel, ABC):
 
 class AssistantEvent(BaseEvent):
     content: str
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    session_total_tokens: int = 0
-    last_turn_duration: float = 0.0
-    tokens_per_second: float = 0.0
     stopped_by_middleware: bool = False
+
+    def __add__(self, other: AssistantEvent) -> AssistantEvent:
+        return AssistantEvent(
+            content=self.content + other.content,
+            stopped_by_middleware=self.stopped_by_middleware
+            or other.stopped_by_middleware,
+        )
+
+
+class ReasoningEvent(BaseEvent):
+    content: str
 
 
 class ToolCallEvent(BaseEvent):
@@ -263,9 +324,11 @@ class OutputFormat(StrEnum):
 
 
 type AsyncApprovalCallback = Callable[
-    [str, dict[str, Any], str], Awaitable[tuple[str, str | None]]
+    [str, BaseModel, str], Awaitable[tuple[ApprovalResponse, str | None]]
 ]
 
-type SyncApprovalCallback = Callable[[str, dict[str, Any], str], tuple[str, str | None]]
+type SyncApprovalCallback = Callable[
+    [str, BaseModel, str], tuple[ApprovalResponse, str | None]
+]
 
 type ApprovalCallback = AsyncApprovalCallback | SyncApprovalCallback

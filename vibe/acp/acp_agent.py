@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from pathlib import Path
 import sys
-from typing import Any, cast, override
+from typing import cast, override
 
 from acp import (
     PROTOCOL_VERSION,
@@ -46,18 +46,26 @@ from acp.schema import (
 )
 from pydantic import BaseModel, ConfigDict
 
-from vibe import VIBE_ROOT
+from vibe import VIBE_ROOT, __version__
 from vibe.acp.tools.base import BaseAcpTool
 from vibe.acp.tools.session_update import (
     tool_call_session_update,
     tool_result_session_update,
 )
-from vibe.acp.utils import TOOL_OPTIONS, ToolOption, VibeSessionMode
-from vibe.core import __version__
+from vibe.acp.utils import (
+    TOOL_OPTIONS,
+    ToolOption,
+    acp_to_agent_mode,
+    get_all_acp_session_modes,
+    is_valid_acp_mode,
+)
 from vibe.core.agent import Agent as VibeAgent
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
 from vibe.core.config import MissingAPIKeyError, VibeConfig, load_api_keys_from_env
+from vibe.core.modes import AgentMode
+from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
+    ApprovalResponse,
     AssistantEvent,
     AsyncApprovalCallback,
     ToolCallEvent,
@@ -70,7 +78,6 @@ class AcpSession(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     id: str
     agent: VibeAgent
-    mode_id: VibeSessionMode = VibeSessionMode.APPROVAL_REQUIRED
     task: asyncio.Task[None] | None = None
 
 
@@ -152,9 +159,11 @@ class VibeAcpAgent(AcpAgent):
     async def newSession(self, params: NewSessionRequest) -> NewSessionResponse:
         capability_disabled_tools = self._get_disabled_tools_from_capabilities()
         load_api_keys_from_env()
+
+        cwd = Path(params.cwd)
         try:
             config = VibeConfig.load(
-                workdir=Path(params.cwd),
+                workdir=cwd,
                 tool_paths=[str(VIBE_ROOT / "acp" / "tools" / "builtins")],
                 disabled_tools=capability_disabled_tools,
             )
@@ -163,7 +172,7 @@ class VibeAcpAgent(AcpAgent):
                 "message": "You must be authenticated before creating a new session"
             }) from e
 
-        agent = VibeAgent(config=config, auto_approve=False, enable_streaming=True)
+        agent = VibeAgent(config=config, mode=AgentMode.DEFAULT, enable_streaming=True)
         # NOTE: For now, we pin session.id to agent.session_id right after init time.
         # We should just use agent.session_id everywhere, but it can still change during
         # session lifetime (e.g. agent.compact is called).
@@ -186,8 +195,8 @@ class VibeAcpAgent(AcpAgent):
                 ],
             ),
             modes=SessionModeState(
-                currentModeId=session.mode_id,
-                availableModes=VibeSessionMode.get_all_acp_session_modes(),
+                currentModeId=session.agent.mode.value,
+                availableModes=get_all_acp_session_modes(),
             ),
         )
         return response
@@ -211,10 +220,32 @@ class VibeAcpAgent(AcpAgent):
         return disabled
 
     def _create_approval_callback(self, session_id: str) -> AsyncApprovalCallback:
+        session = self._get_session(session_id)
+
+        def _handle_permission_selection(
+            option_id: str, tool_name: str
+        ) -> tuple[ApprovalResponse, str | None]:
+            match option_id:
+                case ToolOption.ALLOW_ONCE:
+                    return (ApprovalResponse.YES, None)
+                case ToolOption.ALLOW_ALWAYS:
+                    if tool_name not in session.agent.config.tools:
+                        session.agent.config.tools[tool_name] = BaseToolConfig()
+                    session.agent.config.tools[
+                        tool_name
+                    ].permission = ToolPermission.ALWAYS
+                    return (ApprovalResponse.YES, None)
+                case ToolOption.REJECT_ONCE:
+                    return (
+                        ApprovalResponse.NO,
+                        "User rejected the tool call, provide an alternative plan",
+                    )
+                case _:
+                    return (ApprovalResponse.NO, f"Unknown option: {option_id}")
 
         async def approval_callback(
-            tool_name: str, args: dict[str, Any], tool_call_id: str
-        ) -> tuple[str, str | None]:
+            tool_name: str, args: BaseModel, tool_call_id: str
+        ) -> tuple[ApprovalResponse, str | None]:
             # Create the tool call update
             tool_call = ToolCall(toolCallId=tool_call_id)
 
@@ -228,10 +259,10 @@ class VibeAcpAgent(AcpAgent):
             # Parse the response using isinstance for proper type narrowing
             if response.outcome.outcome == "selected":
                 outcome = cast(AllowedOutcome, response.outcome)
-                return self._handle_permission_selection(outcome.optionId)
+                return _handle_permission_selection(outcome.optionId, tool_name)
             else:
                 return (
-                    "n",
+                    ApprovalResponse.NO,
                     str(
                         get_user_cancellation_message(
                             CancellationReason.OPERATION_CANCELLED
@@ -240,18 +271,6 @@ class VibeAcpAgent(AcpAgent):
                 )
 
         return approval_callback
-
-    @staticmethod
-    def _handle_permission_selection(option_id: str) -> tuple[str, str | None]:
-        match option_id:
-            case ToolOption.ALLOW_ONCE:
-                return ("y", None)
-            case ToolOption.ALLOW_ALWAYS:
-                return ("a", None)
-            case ToolOption.REJECT_ONCE:
-                return ("n", "User rejected the tool call, provide an alternative plan")
-            case _:
-                return ("n", f"Unknown option: {option_id}")
 
     def _get_session(self, session_id: str) -> AcpSession:
         if session_id not in self.sessions:
@@ -268,11 +287,21 @@ class VibeAcpAgent(AcpAgent):
     ) -> SetSessionModeResponse | None:
         session = self._get_session(params.sessionId)
 
-        if not VibeSessionMode.is_valid(params.modeId):
+        if not is_valid_acp_mode(params.modeId):
             return None
 
-        session.mode_id = VibeSessionMode(params.modeId)
-        session.agent.auto_approve = params.modeId == VibeSessionMode.AUTO_APPROVE
+        new_mode = acp_to_agent_mode(params.modeId)
+        if new_mode is None:
+            return None
+
+        await session.agent.switch_mode(new_mode)
+
+        if new_mode.auto_approve:
+            session.agent.approval_callback = None
+        else:
+            session.agent.set_approval_callback(
+                self._create_approval_callback(session.id)
+            )
 
         return SetSessionModeResponse()
 

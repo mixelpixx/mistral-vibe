@@ -9,22 +9,19 @@ import pytest
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_connection import FakeAgentSideConnection
 from vibe.acp.acp_agent import VibeAcpAgent
-from vibe.acp.utils import VibeSessionMode
 from vibe.core.agent import Agent
 from vibe.core.config import ModelConfig, VibeConfig
+from vibe.core.modes import AgentMode
 from vibe.core.types import LLMChunk, LLMMessage, LLMUsage, Role
 
 
 @pytest.fixture
 def backend() -> FakeBackend:
     backend = FakeBackend(
-        results=[
-            LLMChunk(
-                message=LLMMessage(role=Role.assistant, content="Hi"),
-                finish_reason="end_turn",
-                usage=LLMUsage(prompt_tokens=1, completion_tokens=1),
-            )
-        ]
+        LLMChunk(
+            message=LLMMessage(role=Role.assistant, content="Hi"),
+            usage=LLMUsage(prompt_tokens=1, completion_tokens=1),
+        )
     )
     return backend
 
@@ -101,18 +98,21 @@ class TestACPNewSession:
         assert session_response.modes is not None
         assert session_response.modes.currentModeId is not None
         assert session_response.modes.availableModes is not None
-        assert len(session_response.modes.availableModes) == 2
+        assert len(session_response.modes.availableModes) == 4
 
-        assert session_response.modes.currentModeId == VibeSessionMode.APPROVAL_REQUIRED
+        assert session_response.modes.currentModeId == AgentMode.DEFAULT.value
+        assert session_response.modes.availableModes[0].id == AgentMode.DEFAULT.value
+        assert session_response.modes.availableModes[0].name == "Default"
         assert (
-            session_response.modes.availableModes[0].id
-            == VibeSessionMode.APPROVAL_REQUIRED
-        )
-        assert session_response.modes.availableModes[0].name == "Approval Required"
-        assert (
-            session_response.modes.availableModes[1].id == VibeSessionMode.AUTO_APPROVE
+            session_response.modes.availableModes[1].id == AgentMode.AUTO_APPROVE.value
         )
         assert session_response.modes.availableModes[1].name == "Auto Approve"
+        assert session_response.modes.availableModes[2].id == AgentMode.PLAN.value
+        assert session_response.modes.availableModes[2].name == "Plan"
+        assert (
+            session_response.modes.availableModes[3].id == AgentMode.ACCEPT_EDITS.value
+        )
+        assert session_response.modes.availableModes[3].name == "Accept Edits"
 
     @pytest.mark.skip(reason="TODO: Fix this test")
     @pytest.mark.asyncio

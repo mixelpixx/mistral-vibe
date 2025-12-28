@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import importlib.util
 import inspect
 from logging import getLogger
@@ -9,8 +9,8 @@ import re
 import sys
 from typing import TYPE_CHECKING, Any
 
-from vibe import VIBE_ROOT
-from vibe.core.config import get_vibe_home
+from vibe.core.paths.config_paths import resolve_local_tools_dir
+from vibe.core.paths.global_paths import DEFAULT_TOOL_DIR, GLOBAL_TOOLS_DIR
 from vibe.core.tools.base import BaseTool, BaseToolConfig
 from vibe.core.tools.mcp import (
     RemoteTool,
@@ -31,9 +31,6 @@ class NoSuchToolError(Exception):
     """Exception raised when a tool is not found."""
 
 
-DEFAULT_TOOL_DIR = VIBE_ROOT / "core" / "tools" / "builtins"
-
-
 class ToolManager:
     """Manages tool discovery and instantiation for an Agent.
 
@@ -41,35 +38,33 @@ class ToolManager:
     should have its own ToolManager instance.
     """
 
-    def __init__(self, config: VibeConfig) -> None:
-        self._config = config
+    def __init__(self, config_getter: Callable[[], VibeConfig]) -> None:
+        self._config_getter = config_getter
         self._instances: dict[str, BaseTool] = {}
-        self._search_paths: list[Path] = self._compute_search_paths(config)
+        self._search_paths: list[Path] = self._compute_search_paths(self._config)
 
         self._available: dict[str, type[BaseTool]] = {
             cls.get_name(): cls for cls in self._iter_tool_classes(self._search_paths)
         }
         self._integrate_mcp()
 
+    @property
+    def _config(self) -> VibeConfig:
+        return self._config_getter()
+
     @staticmethod
     def _compute_search_paths(config: VibeConfig) -> list[Path]:
-        paths: list[Path] = [DEFAULT_TOOL_DIR]
+        paths: list[Path] = [DEFAULT_TOOL_DIR.path]
 
-        for p in config.tool_paths:
-            path = Path(p).expanduser().resolve()
+        for path in config.tool_paths:
             if path.is_dir():
                 paths.append(path)
 
-        cwd = config.effective_workdir
-        for directory in (cwd, *cwd.parents):
-            tools_dir = directory / ".vibe" / "tools"
-            if tools_dir.is_dir():
-                paths.append(tools_dir)
-                break
+        if (tools_dir := resolve_local_tools_dir(config.effective_workdir)) is not None:
+            paths.append(tools_dir)
 
-        global_tools = get_vibe_home() / "tools"
-        if global_tools.is_dir():
-            paths.append(global_tools)
+        if GLOBAL_TOOLS_DIR.path.is_dir():
+            paths.append(GLOBAL_TOOLS_DIR.path)
 
         unique: list[Path] = []
         seen: set[Path] = set()
@@ -120,7 +115,7 @@ class ToolManager:
         search_paths: list[Path] | None = None,
     ) -> dict[str, dict[str, Any]]:
         if search_paths is None:
-            search_paths = [DEFAULT_TOOL_DIR]
+            search_paths = [DEFAULT_TOOL_DIR.path]
 
         defaults: dict[str, dict[str, Any]] = {}
         for cls in ToolManager._iter_tool_classes(search_paths):

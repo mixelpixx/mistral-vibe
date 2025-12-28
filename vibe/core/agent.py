@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
 from enum import StrEnum, auto
 import time
-from typing import Any, cast
+from typing import cast
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -22,11 +21,14 @@ from vibe.core.middleware import (
     MiddlewareAction,
     MiddlewarePipeline,
     MiddlewareResult,
+    PlanModeMiddleware,
     PriceLimitMiddleware,
     ResetReason,
     TurnLimitMiddleware,
 )
+from vibe.core.modes import AgentMode
 from vibe.core.prompts import UtilityPrompt
+from vibe.core.skills.manager import SkillManager
 from vibe.core.system_prompt import get_universal_system_prompt
 from vibe.core.tools.base import (
     BaseTool,
@@ -38,22 +40,24 @@ from vibe.core.tools.manager import ToolManager
 from vibe.core.types import (
     AgentStats,
     ApprovalCallback,
+    ApprovalResponse,
     AssistantEvent,
+    AsyncApprovalCallback,
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
     LLMChunk,
     LLMMessage,
+    LLMUsage,
+    ReasoningEvent,
     Role,
     SyncApprovalCallback,
-    ToolCall,
     ToolCallEvent,
     ToolResultEvent,
 )
 from vibe.core.utils import (
     TOOL_ERROR_TAG,
     VIBE_STOP_EVENT_TAG,
-    ApprovalResponse,
     CancellationReason,
     get_user_agent,
     get_user_cancellation_message,
@@ -87,16 +91,21 @@ class Agent:
     def __init__(
         self,
         config: VibeConfig,
-        auto_approve: bool = False,
+        mode: AgentMode = AgentMode.DEFAULT,
         message_observer: Callable[[LLMMessage], None] | None = None,
         max_turns: int | None = None,
         max_price: float | None = None,
         backend: BackendLike | None = None,
         enable_streaming: bool = False,
     ) -> None:
+        """Initialize the agent with configuration and mode."""
         self.config = config
+        self._mode = mode
+        self._max_turns = max_turns
+        self._max_price = max_price
 
-        self.tool_manager = ToolManager(config)
+        self.tool_manager = ToolManager(lambda: self.config)
+        self.skill_manager = SkillManager(lambda: self.config)
         self.format_handler = APIToolFormatHandler()
 
         self.backend_factory = lambda: backend or self._select_backend()
@@ -106,10 +115,11 @@ class Agent:
         self._last_observed_message_index: int = 0
         self.middleware_pipeline = MiddlewarePipeline()
         self.enable_streaming = enable_streaming
-        self._setup_middleware(max_turns, max_price)
+        self._setup_middleware()
 
-        system_prompt = get_universal_system_prompt(self.tool_manager, config)
-
+        system_prompt = get_universal_system_prompt(
+            self.tool_manager, config, self.skill_manager
+        )
         self.messages = [LLMMessage(role=Role.system, content=system_prompt)]
 
         if self.message_observer:
@@ -124,7 +134,6 @@ class Agent:
         except ValueError:
             pass
 
-        self.auto_approve = auto_approve
         self.approval_callback: ApprovalCallback | None = None
 
         self.session_id = str(uuid4())
@@ -132,11 +141,17 @@ class Agent:
         self.interaction_logger = InteractionLogger(
             config.session_logging,
             self.session_id,
-            auto_approve,
+            self.auto_approve,
             config.effective_workdir,
         )
 
-        self._last_chunk: LLMChunk | None = None
+    @property
+    def mode(self) -> AgentMode:
+        return self._mode
+
+    @property
+    def auto_approve(self) -> bool:
+        return self._mode.auto_approve
 
     def _select_backend(self) -> BackendLike:
         active_model = self.config.get_active_model()
@@ -163,14 +178,15 @@ class Agent:
         async for event in self._conversation_loop(msg):
             yield event
 
-    def _setup_middleware(self, max_turns: int | None, max_price: float | None) -> None:
+    def _setup_middleware(self) -> None:
+        """Configure middleware pipeline for this conversation."""
         self.middleware_pipeline.clear()
 
-        if max_turns is not None:
-            self.middleware_pipeline.add(TurnLimitMiddleware(max_turns))
+        if self._max_turns is not None:
+            self.middleware_pipeline.add(TurnLimitMiddleware(self._max_turns))
 
-        if max_price is not None:
-            self.middleware_pipeline.add(PriceLimitMiddleware(max_price))
+        if self._max_price is not None:
+            self.middleware_pipeline.add(PriceLimitMiddleware(self._max_price))
 
         if self.config.auto_compact_threshold > 0:
             self.middleware_pipeline.add(
@@ -181,6 +197,8 @@ class Agent:
                     ContextWarningMiddleware(0.5, self.config.auto_compact_threshold)
                 )
 
+        self.middleware_pipeline.add(PlanModeMiddleware(lambda: self._mode))
+
     async def _handle_middleware_result(
         self, result: MiddlewareResult
     ) -> AsyncGenerator[BaseEvent]:
@@ -188,15 +206,7 @@ class Agent:
             case MiddlewareAction.STOP:
                 yield AssistantEvent(
                     content=f"<{VIBE_STOP_EVENT_TAG}>{result.reason}</{VIBE_STOP_EVENT_TAG}>",
-                    prompt_tokens=0,
-                    completion_tokens=0,
-                    session_total_tokens=self.stats.session_total_llm_tokens,
-                    last_turn_duration=0,
-                    tokens_per_second=0,
                     stopped_by_middleware=True,
-                )
-                await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager
                 )
 
             case MiddlewareAction.INJECT_MESSAGE:
@@ -245,12 +255,10 @@ class Agent:
                 result = await self.middleware_pipeline.run_before_turn(
                     self._get_context()
                 )
-
                 async for event in self._handle_middleware_result(result):
                     yield event
 
                 if result.action == MiddlewareAction.STOP:
-                    self._flush_new_messages()
                     return
 
                 self.stats.steps += 1
@@ -261,50 +269,29 @@ class Agent:
                     yield event
 
                 last_message = self.messages[-1]
-                should_break_loop = (
-                    last_message.role != Role.tool
-                    and self._last_chunk is not None
-                    and self._last_chunk.finish_reason is not None
-                )
+                should_break_loop = last_message.role != Role.tool
 
                 self._flush_new_messages()
-                await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager
-                )
 
                 if user_cancelled:
-                    self._flush_new_messages()
-                    await self.interaction_logger.save_interaction(
-                        self.messages, self.stats, self.config, self.tool_manager
-                    )
                     return
 
                 after_result = await self.middleware_pipeline.run_after_turn(
                     self._get_context()
                 )
-
                 async for event in self._handle_middleware_result(after_result):
                     yield event
 
                 if after_result.action == MiddlewareAction.STOP:
-                    self._flush_new_messages()
                     return
 
-                self._flush_new_messages()
-                await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager
-                )
-
-        except Exception:
+        finally:
             self._flush_new_messages()
             await self.interaction_logger.save_interaction(
                 self.messages, self.stats, self.config, self.tool_manager
             )
-            raise
 
-    async def _perform_llm_turn(
-        self,
-    ) -> AsyncGenerator[AssistantEvent | ToolCallEvent | ToolResultEvent]:
+    async def _perform_llm_turn(self) -> AsyncGenerator[BaseEvent, None]:
         if self.enable_streaming:
             async for event in self._stream_assistant_events():
                 yield event
@@ -314,19 +301,11 @@ class Agent:
                 yield assistant_event
 
         last_message = self.messages[-1]
-        last_chunk = self._last_chunk
-        if last_chunk is None or last_chunk.usage is None:
-            raise LLMResponseError("LLM response missing chunk or usage data")
 
         parsed = self.format_handler.parse_message(last_message)
         resolved = self.format_handler.resolve_tool_calls(
             parsed, self.tool_manager, self.config
         )
-
-        if last_chunk.usage.completion_tokens > 0 and self.stats.last_turn_duration > 0:
-            self.stats.tokens_per_second = (
-                last_chunk.usage.completion_tokens / self.stats.last_turn_duration
-            )
 
         if not resolved.tool_calls and not resolved.failed_calls:
             return
@@ -334,103 +313,55 @@ class Agent:
         async for event in self._handle_tool_calls(resolved):
             yield event
 
-    def _create_assistant_event(
-        self, content: str, chunk: LLMChunk | None
-    ) -> AssistantEvent:
-        return AssistantEvent(
-            content=content,
-            prompt_tokens=chunk.usage.prompt_tokens if chunk and chunk.usage else 0,
-            completion_tokens=chunk.usage.completion_tokens
-            if chunk and chunk.usage
-            else 0,
-            session_total_tokens=self.stats.session_total_llm_tokens,
-            last_turn_duration=self.stats.last_turn_duration,
-            tokens_per_second=self.stats.tokens_per_second,
-        )
-
-    async def _stream_assistant_events(self) -> AsyncGenerator[AssistantEvent]:
-        chunks: list[LLMChunk] = []
+    async def _stream_assistant_events(
+        self,
+    ) -> AsyncGenerator[AssistantEvent | ReasoningEvent]:
         content_buffer = ""
+        reasoning_buffer = ""
         chunks_with_content = 0
+        chunks_with_reasoning = 0
         BATCH_SIZE = 5
 
         async for chunk in self._chat_streaming():
-            chunks.append(chunk)
-
-            if chunk.message.tool_calls and chunk.finish_reason is None:
-                if chunk.message.content:
-                    content_buffer += chunk.message.content
-                    chunks_with_content += 1
-
+            if chunk.message.reasoning_content:
                 if content_buffer:
-                    yield self._create_assistant_event(content_buffer, chunk)
+                    yield AssistantEvent(content=content_buffer)
                     content_buffer = ""
                     chunks_with_content = 0
-                continue
+
+                reasoning_buffer += chunk.message.reasoning_content
+                chunks_with_reasoning += 1
+
+                if chunks_with_reasoning >= BATCH_SIZE:
+                    yield ReasoningEvent(content=reasoning_buffer)
+                    reasoning_buffer = ""
+                    chunks_with_reasoning = 0
 
             if chunk.message.content:
+                if reasoning_buffer:
+                    yield ReasoningEvent(content=reasoning_buffer)
+                    reasoning_buffer = ""
+                    chunks_with_reasoning = 0
+
                 content_buffer += chunk.message.content
                 chunks_with_content += 1
 
                 if chunks_with_content >= BATCH_SIZE:
-                    yield self._create_assistant_event(content_buffer, chunk)
+                    yield AssistantEvent(content=content_buffer)
                     content_buffer = ""
                     chunks_with_content = 0
 
+        if reasoning_buffer:
+            yield ReasoningEvent(content=reasoning_buffer)
+
         if content_buffer:
-            last_chunk = chunks[-1] if chunks else None
-            yield self._create_assistant_event(content_buffer, last_chunk)
-
-        full_content = ""
-        full_tool_calls_map = OrderedDict[int, ToolCall]()
-        for chunk in chunks:
-            full_content += chunk.message.content or ""
-            if not chunk.message.tool_calls:
-                continue
-
-            for tc in chunk.message.tool_calls:
-                if tc.index is None:
-                    raise LLMResponseError("Tool call chunk missing index")
-                if tc.index not in full_tool_calls_map:
-                    full_tool_calls_map[tc.index] = tc
-                else:
-                    new_args_str = (
-                        full_tool_calls_map[tc.index].function.arguments or ""
-                    ) + (tc.function.arguments or "")
-                    full_tool_calls_map[tc.index].function.arguments = new_args_str
-
-        full_tool_calls = list(full_tool_calls_map.values()) or None
-        last_message = LLMMessage(
-            role=Role.assistant, content=full_content, tool_calls=full_tool_calls
-        )
-        self.messages.append(last_message)
-        finish_reason = next(
-            (c.finish_reason for c in chunks if c.finish_reason is not None), None
-        )
-        self._last_chunk = LLMChunk(
-            message=last_message, usage=chunks[-1].usage, finish_reason=finish_reason
-        )
+            yield AssistantEvent(content=content_buffer)
 
     async def _get_assistant_event(self) -> AssistantEvent:
         llm_result = await self._chat()
-        if llm_result.usage is None:
-            raise LLMResponseError(
-                "Usage data missing in non-streaming completion response"
-            )
-        self._last_chunk = llm_result
-        assistant_msg = llm_result.message
-        self.messages.append(assistant_msg)
+        return AssistantEvent(content=llm_result.message.content or "")
 
-        return AssistantEvent(
-            content=assistant_msg.content or "",
-            prompt_tokens=llm_result.usage.prompt_tokens,
-            completion_tokens=llm_result.usage.completion_tokens,
-            session_total_tokens=self.stats.session_total_llm_tokens,
-            last_turn_duration=self.stats.last_turn_duration,
-            tokens_per_second=self.stats.tokens_per_second,
-        )
-
-    async def _handle_tool_calls(  # noqa: PLR0915
+    async def _handle_tool_calls(
         self, resolved: ResolvedMessage
     ) -> AsyncGenerator[ToolCallEvent | ToolResultEvent]:
         for failed in resolved.failed_calls:
@@ -480,7 +411,7 @@ class Agent:
                 continue
 
             decision = await self._should_execute_tool(
-                tool_instance, tool_call.args_dict, tool_call_id
+                tool_instance, tool_call.validated_args, tool_call_id
             )
 
             if decision.verdict == ToolExecutionResponse.SKIP:
@@ -554,9 +485,6 @@ class Agent:
                         )
                     )
                 )
-                await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager
-                )
                 raise
 
             except KeyboardInterrupt:
@@ -575,9 +503,6 @@ class Agent:
                             tool_call, cancel
                         )
                     )
-                )
-                await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager
                 )
                 raise
 
@@ -616,7 +541,6 @@ class Agent:
 
         try:
             start_time = time.perf_counter()
-
             async with self.backend as backend:
                 result = await backend.complete(
                     model=active_model,
@@ -630,31 +554,19 @@ class Agent:
                     },
                     max_tokens=max_tokens,
                 )
-
             end_time = time.perf_counter()
+
             if result.usage is None:
                 raise LLMResponseError(
                     "Usage data missing in non-streaming completion response"
                 )
-
-            self.stats.last_turn_duration = end_time - start_time
-            self.stats.last_turn_prompt_tokens = result.usage.prompt_tokens
-            self.stats.last_turn_completion_tokens = result.usage.completion_tokens
-            self.stats.session_prompt_tokens += result.usage.prompt_tokens
-            self.stats.session_completion_tokens += result.usage.completion_tokens
-            self.stats.context_tokens = (
-                result.usage.prompt_tokens + result.usage.completion_tokens
-            )
+            self._update_stats(usage=result.usage, time_seconds=end_time - start_time)
 
             processed_message = self.format_handler.process_api_response_message(
                 result.message
             )
-
-            return LLMChunk(
-                message=processed_message,
-                usage=result.usage,
-                finish_reason=result.finish_reason,
-            )
+            self.messages.append(processed_message)
+            return LLMChunk(message=processed_message, usage=result.usage)
 
         except Exception as e:
             raise RuntimeError(
@@ -673,7 +585,8 @@ class Agent:
         tool_choice = self.format_handler.get_tool_choice()
         try:
             start_time = time.perf_counter()
-            last_chunk = None
+            usage = LLMUsage()
+            chunk_agg = LLMChunk(message=LLMMessage(role=Role.assistant))
             async with self.backend as backend:
                 async for chunk in backend.complete_streaming(
                     model=active_model,
@@ -687,48 +600,47 @@ class Agent:
                     },
                     max_tokens=max_tokens,
                 ):
-                    last_chunk = chunk
                     processed_message = (
                         self.format_handler.process_api_response_message(chunk.message)
                     )
-                    yield LLMChunk(
-                        message=processed_message,
-                        usage=chunk.usage,
-                        finish_reason=chunk.finish_reason,
+                    processed_chunk = LLMChunk(
+                        message=processed_message, usage=chunk.usage
                     )
-
+                    chunk_agg += processed_chunk
+                    usage += chunk.usage or LLMUsage()
+                    yield processed_chunk
             end_time = time.perf_counter()
-            if last_chunk is None:
-                raise LLMResponseError("Streamed completion returned no chunks")
-            if last_chunk.usage is None:
+
+            if chunk_agg.usage is None:
                 raise LLMResponseError(
                     "Usage data missing in final chunk of streamed completion"
                 )
+            self._update_stats(usage=usage, time_seconds=end_time - start_time)
 
-            self.stats.last_turn_duration = end_time - start_time
-            self.stats.last_turn_prompt_tokens = last_chunk.usage.prompt_tokens
-            self.stats.last_turn_completion_tokens = last_chunk.usage.completion_tokens
-            self.stats.session_prompt_tokens += last_chunk.usage.prompt_tokens
-            self.stats.session_completion_tokens += last_chunk.usage.completion_tokens
-            self.stats.context_tokens = (
-                last_chunk.usage.prompt_tokens + last_chunk.usage.completion_tokens
-            )
+            self.messages.append(chunk_agg.message)
 
         except Exception as e:
             raise RuntimeError(
                 f"API error from {provider.name} (model: {active_model.name}): {e}"
             ) from e
 
+    def _update_stats(self, usage: LLMUsage, time_seconds: float) -> None:
+        self.stats.last_turn_duration = time_seconds
+        self.stats.last_turn_prompt_tokens = usage.prompt_tokens
+        self.stats.last_turn_completion_tokens = usage.completion_tokens
+        self.stats.session_prompt_tokens += usage.prompt_tokens
+        self.stats.session_completion_tokens += usage.completion_tokens
+        self.stats.context_tokens = usage.prompt_tokens + usage.completion_tokens
+        if time_seconds > 0 and usage.completion_tokens > 0:
+            self.stats.tokens_per_second = usage.completion_tokens / time_seconds
+
     async def _should_execute_tool(
-        self, tool: BaseTool, args: dict[str, Any], tool_call_id: str
+        self, tool: BaseTool, args: BaseModel, tool_call_id: str
     ) -> ToolDecision:
         if self.auto_approve:
             return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
 
-        args_model, _ = tool._get_tool_args_results()
-        validated_args = args_model.model_validate(args)
-
-        allowlist_denylist_result = tool.check_allowlist_denylist(validated_args)
+        allowlist_denylist_result = tool.check_allowlist_denylist(args)
         if allowlist_denylist_result == ToolPermission.ALWAYS:
             return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
         elif allowlist_denylist_result == ToolPermission.NEVER:
@@ -753,7 +665,7 @@ class Agent:
         return await self._ask_approval(tool_name, args, tool_call_id)
 
     async def _ask_approval(
-        self, tool_name: str, args: dict[str, Any], tool_call_id: str
+        self, tool_name: str, args: BaseModel, tool_call_id: str
     ) -> ToolDecision:
         if not self.approval_callback:
             return ToolDecision(
@@ -761,24 +673,18 @@ class Agent:
                 feedback="Tool execution not permitted.",
             )
         if asyncio.iscoroutinefunction(self.approval_callback):
-            response, feedback = await self.approval_callback(
-                tool_name, args, tool_call_id
-            )
+            async_callback = cast(AsyncApprovalCallback, self.approval_callback)
+            response, feedback = await async_callback(tool_name, args, tool_call_id)
         else:
             sync_callback = cast(SyncApprovalCallback, self.approval_callback)
             response, feedback = sync_callback(tool_name, args, tool_call_id)
 
         match response:
-            case ApprovalResponse.ALWAYS:
-                self.auto_approve = True
-                return ToolDecision(
-                    verdict=ToolExecutionResponse.EXECUTE, feedback=feedback
-                )
             case ApprovalResponse.YES:
                 return ToolDecision(
                     verdict=ToolExecutionResponse.EXECUTE, feedback=feedback
                 )
-            case _:
+            case ApprovalResponse.NO:
                 return ToolDecision(
                     verdict=ToolExecutionResponse.SKIP, feedback=feedback
                 )
@@ -870,6 +776,7 @@ class Agent:
         self._reset_session()
 
     async def compact(self) -> str:
+        """Compact the conversation history."""
         try:
             self._clean_message_history()
             await self.interaction_logger.save_interaction(
@@ -932,6 +839,16 @@ class Agent:
             )
             raise
 
+    async def switch_mode(self, new_mode: AgentMode) -> None:
+        if new_mode == self._mode:
+            return
+        new_config = VibeConfig.load(
+            workdir=self.config.workdir, **new_mode.config_overrides
+        )
+
+        await self.reload_with_initial_messages(config=new_config)
+        self._mode = new_mode
+
     async def reload_with_initial_messages(
         self,
         config: VibeConfig | None = None,
@@ -943,22 +860,28 @@ class Agent:
         )
 
         preserved_messages = self.messages[1:] if len(self.messages) > 1 else []
-        old_system_prompt = self.messages[0].content if len(self.messages) > 0 else ""
 
         if config is not None:
             self.config = config
             self.backend = self.backend_factory()
 
-        self.tool_manager = ToolManager(self.config)
+        if max_turns is not None:
+            self._max_turns = max_turns
+        if max_price is not None:
+            self._max_price = max_price
 
-        new_system_prompt = get_universal_system_prompt(self.tool_manager, self.config)
+        self.tool_manager = ToolManager(lambda: self.config)
+        self.skill_manager = SkillManager(lambda: self.config)
+
+        new_system_prompt = get_universal_system_prompt(
+            self.tool_manager, self.config, self.skill_manager
+        )
         self.messages = [LLMMessage(role=Role.system, content=new_system_prompt)]
-        did_system_prompt_change = old_system_prompt != new_system_prompt
 
         if preserved_messages:
             self.messages.extend(preserved_messages)
 
-        if len(self.messages) == 1 or did_system_prompt_change:
+        if len(self.messages) == 1:
             self.stats.reset_context_state()
 
         try:
@@ -971,7 +894,7 @@ class Agent:
 
         self._last_observed_message_index = 0
 
-        self._setup_middleware(max_turns, max_price)
+        self._setup_middleware()
 
         if self.message_observer:
             for msg in self.messages:

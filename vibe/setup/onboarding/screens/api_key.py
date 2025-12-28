@@ -29,8 +29,8 @@ CONFIG_DOCS_URL = (
 
 
 def _save_api_key_to_env_file(env_key: str, api_key: str) -> None:
-    GLOBAL_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    set_key(GLOBAL_ENV_FILE, env_key, api_key)
+    GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
+    set_key(GLOBAL_ENV_FILE.path, env_key, api_key)
 
 
 class ApiKeyScreen(OnboardingScreen):

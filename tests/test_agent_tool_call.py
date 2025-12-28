@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
 
+from pydantic import BaseModel
 import pytest
 
 from tests.mock.utils import mock_llm_chunk
@@ -11,9 +11,11 @@ from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_tool import FakeTool
 from vibe.core.agent import Agent
 from vibe.core.config import SessionLoggingConfig, VibeConfig
+from vibe.core.modes import AgentMode
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.tools.builtins.todo import TodoItem
 from vibe.core.types import (
+    ApprovalResponse,
     AssistantEvent,
     BaseEvent,
     FunctionCall,
@@ -24,7 +26,6 @@ from vibe.core.types import (
     ToolCallEvent,
     ToolResultEvent,
 )
-from vibe.core.utils import ApprovalResponse
 
 
 async def act_and_collect_events(agent: Agent, prompt: str) -> list[BaseEvent]:
@@ -43,10 +44,12 @@ def make_config(todo_permission: ToolPermission = ToolPermission.ALWAYS) -> Vibe
     )
 
 
-def make_todo_tool_call(call_id: str, action: str = "read") -> ToolCall:
+def make_todo_tool_call(
+    call_id: str, index: int = 0, arguments: str | None = None
+) -> ToolCall:
+    args = arguments if arguments is not None else '{"action": "read"}'
     return ToolCall(
-        id=call_id,
-        function=FunctionCall(name="todo", arguments=f'{{"action": "{action}"}}'),
+        id=call_id, index=index, function=FunctionCall(name="todo", arguments=args)
     )
 
 
@@ -57,10 +60,9 @@ def make_agent(
     backend: FakeBackend,
     approval_callback: SyncApprovalCallback | None = None,
 ) -> Agent:
+    mode = AgentMode.AUTO_APPROVE if auto_approve else AgentMode.DEFAULT
     agent = Agent(
-        make_config(todo_permission=todo_permission),
-        auto_approve=auto_approve,
-        backend=backend,
+        make_config(todo_permission=todo_permission), mode=mode, backend=backend
     )
     if approval_callback:
         agent.set_approval_callback(approval_callback)
@@ -72,8 +74,8 @@ async def test_single_tool_call_executes_under_auto_approve() -> None:
     mocked_tool_call_id = "call_1"
     tool_call = make_todo_tool_call(mocked_tool_call_id)
     backend = FakeBackend([
-        mock_llm_chunk(content="Let me check your todos.", tool_calls=[tool_call]),
-        mock_llm_chunk(content="I retrieved 0 todos.", finish_reason="stop"),
+        [mock_llm_chunk(content="Let me check your todos.", tool_calls=[tool_call])],
+        [mock_llm_chunk(content="I retrieved 0 todos.")],
     ])
     agent = make_agent(auto_approve=True, backend=backend)
 
@@ -108,14 +110,13 @@ async def test_tool_call_requires_approval_if_not_auto_approved() -> None:
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
         backend=FakeBackend([
-            mock_llm_chunk(
-                content="Let me check your todos.",
-                tool_calls=[make_todo_tool_call("call_2")],
-            ),
-            mock_llm_chunk(
-                content="I cannot execute the tool without approval.",
-                finish_reason="stop",
-            ),
+            [
+                mock_llm_chunk(
+                    content="Let me check your todos.",
+                    tool_calls=[make_todo_tool_call("call_2")],
+                )
+            ],
+            [mock_llm_chunk(content="I cannot execute the tool without approval.")],
         ]),
     )
 
@@ -139,8 +140,8 @@ async def test_tool_call_requires_approval_if_not_auto_approved() -> None:
 @pytest.mark.asyncio
 async def test_tool_call_approved_by_callback() -> None:
     def approval_callback(
-        _tool_name: str, _args: dict[str, Any], _tool_call_id: str
-    ) -> tuple[str, str | None]:
+        _tool_name: str, _args: BaseModel, _tool_call_id: str
+    ) -> tuple[ApprovalResponse, str | None]:
         return (ApprovalResponse.YES, None)
 
     agent = make_agent(
@@ -148,11 +149,13 @@ async def test_tool_call_approved_by_callback() -> None:
         todo_permission=ToolPermission.ASK,
         approval_callback=approval_callback,
         backend=FakeBackend([
-            mock_llm_chunk(
-                content="Let me check your todos.",
-                tool_calls=[make_todo_tool_call("call_3")],
-            ),
-            mock_llm_chunk(content="I retrieved 0 todos.", finish_reason="stop"),
+            [
+                mock_llm_chunk(
+                    content="Let me check your todos.",
+                    tool_calls=[make_todo_tool_call("call_3")],
+                )
+            ],
+            [mock_llm_chunk(content="I retrieved 0 todos.")],
         ]),
     )
 
@@ -174,8 +177,8 @@ async def test_tool_call_rejected_when_auto_approve_disabled_and_rejected_by_cal
     custom_feedback = "User declined tool execution"
 
     def approval_callback(
-        _tool_name: str, _args: dict[str, Any], _tool_call_id: str
-    ) -> tuple[str, str | None]:
+        _tool_name: str, _args: BaseModel, _tool_call_id: str
+    ) -> tuple[ApprovalResponse, str | None]:
         return (ApprovalResponse.NO, custom_feedback)
 
     agent = make_agent(
@@ -183,13 +186,13 @@ async def test_tool_call_rejected_when_auto_approve_disabled_and_rejected_by_cal
         todo_permission=ToolPermission.ASK,
         approval_callback=approval_callback,
         backend=FakeBackend([
-            mock_llm_chunk(
-                content="Let me check your todos.",
-                tool_calls=[make_todo_tool_call("call_4")],
-            ),
-            mock_llm_chunk(
-                content="Understood, I won't check the todos.", finish_reason="stop"
-            ),
+            [
+                mock_llm_chunk(
+                    content="Let me check your todos.",
+                    tool_calls=[make_todo_tool_call("call_4")],
+                )
+            ],
+            [mock_llm_chunk(content="Understood, I won't check the todos.")],
         ]),
     )
 
@@ -211,11 +214,13 @@ async def test_tool_call_skipped_when_permission_is_never() -> None:
         auto_approve=False,
         todo_permission=ToolPermission.NEVER,
         backend=FakeBackend([
-            mock_llm_chunk(
-                content="Let me check your todos.",
-                tool_calls=[make_todo_tool_call("call_never")],
-            ),
-            mock_llm_chunk(content="Tool is disabled.", finish_reason="stop"),
+            [
+                mock_llm_chunk(
+                    content="Let me check your todos.",
+                    tool_calls=[make_todo_tool_call("call_never")],
+                )
+            ],
+            [mock_llm_chunk(content="Tool is disabled.")],
         ]),
     )
 
@@ -237,35 +242,52 @@ async def test_tool_call_skipped_when_permission_is_never() -> None:
 
 
 @pytest.mark.asyncio
-async def test_approval_always_flips_auto_approve_for_subsequent_calls() -> None:
+async def test_approval_always_sets_tool_permission_for_subsequent_calls() -> None:
     callback_invocations = []
+    agent_ref: Agent | None = None
 
     def approval_callback(
-        tool_name: str, _args: dict[str, Any], _tool_call_id: str
-    ) -> tuple[str, str | None]:
+        tool_name: str, _args: BaseModel, _tool_call_id: str
+    ) -> tuple[ApprovalResponse, str | None]:
         callback_invocations.append(tool_name)
-        return (ApprovalResponse.ALWAYS, None)
+        # Set permission to ALWAYS for this tool (simulating the new behavior)
+        assert agent_ref is not None
+        if tool_name not in agent_ref.config.tools:
+            agent_ref.config.tools[tool_name] = BaseToolConfig()
+        agent_ref.config.tools[tool_name].permission = ToolPermission.ALWAYS
+        return (ApprovalResponse.YES, None)
 
     agent = make_agent(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
         approval_callback=approval_callback,
         backend=FakeBackend([
-            mock_llm_chunk(
-                content="First check.", tool_calls=[make_todo_tool_call("call_first")]
-            ),
-            mock_llm_chunk(content="First done.", finish_reason="stop"),
-            mock_llm_chunk(
-                content="Second check.", tool_calls=[make_todo_tool_call("call_second")]
-            ),
-            mock_llm_chunk(content="Second done.", finish_reason="stop"),
+            [
+                mock_llm_chunk(
+                    content="First check.",
+                    tool_calls=[make_todo_tool_call("call_first")],
+                )
+            ],
+            [mock_llm_chunk(content="First done.")],
+            [
+                mock_llm_chunk(
+                    content="Second check.",
+                    tool_calls=[make_todo_tool_call("call_second")],
+                )
+            ],
+            [mock_llm_chunk(content="Second done.")],
         ]),
     )
+    agent_ref = agent
 
     events1 = await act_and_collect_events(agent, "First request")
     events2 = await act_and_collect_events(agent, "Second request")
 
-    assert agent.auto_approve is True
+    tool_config_todo = agent.tool_manager.get_tool_config("todo")
+    assert tool_config_todo.permission is ToolPermission.ALWAYS
+    tool_config_help = agent.tool_manager.get_tool_config("bash")
+    assert tool_config_help.permission is not ToolPermission.ALWAYS
+    assert agent.auto_approve is False
     assert len(callback_invocations) == 1
     assert callback_invocations[0] == "todo"
     assert isinstance(events1[2], ToolResultEvent)
@@ -280,17 +302,16 @@ async def test_approval_always_flips_auto_approve_for_subsequent_calls() -> None
 
 @pytest.mark.asyncio
 async def test_tool_call_with_invalid_action() -> None:
-    tool_call = ToolCall(
-        id="call_5",
-        function=FunctionCall(name="todo", arguments='{"action": "invalid_action"}'),
-    )
+    tool_call = make_todo_tool_call("call_5", arguments='{"action": "invalid_action"}')
     agent = make_agent(
         auto_approve=True,
         backend=FakeBackend([
-            mock_llm_chunk(content="Let me check your todos.", tool_calls=[tool_call]),
-            mock_llm_chunk(
-                content="I encountered an error with the action.", finish_reason="stop"
-            ),
+            [
+                mock_llm_chunk(
+                    content="Let me check your todos.", tool_calls=[tool_call]
+                )
+            ],
+            [mock_llm_chunk(content="I encountered an error with the action.")],
         ]),
     )
 
@@ -309,24 +330,18 @@ async def test_tool_call_with_duplicate_todo_ids() -> None:
         TodoItem(id="duplicate", content="Task 1"),
         TodoItem(id="duplicate", content="Task 2"),
     ]
-    tool_call = ToolCall(
-        id="call_6",
-        function=FunctionCall(
-            name="todo",
-            arguments=json.dumps({
-                "action": "write",
-                "todos": [t.model_dump() for t in duplicate_todos],
-            }),
-        ),
+    tool_call = make_todo_tool_call(
+        "call_6",
+        arguments=json.dumps({
+            "action": "write",
+            "todos": [t.model_dump() for t in duplicate_todos],
+        }),
     )
     agent = make_agent(
         auto_approve=True,
         backend=FakeBackend([
-            mock_llm_chunk(content="Let me write todos.", tool_calls=[tool_call]),
-            mock_llm_chunk(
-                content="I couldn't write todos with duplicate IDs.",
-                finish_reason="stop",
-            ),
+            [mock_llm_chunk(content="Let me write todos.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="I couldn't write todos with duplicate IDs.")],
         ]),
     )
 
@@ -342,23 +357,18 @@ async def test_tool_call_with_duplicate_todo_ids() -> None:
 @pytest.mark.asyncio
 async def test_tool_call_with_exceeding_max_todos() -> None:
     many_todos = [TodoItem(id=f"todo_{i}", content=f"Task {i}") for i in range(150)]
-    tool_call = ToolCall(
-        id="call_7",
-        function=FunctionCall(
-            name="todo",
-            arguments=json.dumps({
-                "action": "write",
-                "todos": [t.model_dump() for t in many_todos],
-            }),
-        ),
+    tool_call = make_todo_tool_call(
+        "call_7",
+        arguments=json.dumps({
+            "action": "write",
+            "todos": [t.model_dump() for t in many_todos],
+        }),
     )
     agent = make_agent(
         auto_approve=True,
         backend=FakeBackend([
-            mock_llm_chunk(content="Let me write todos.", tool_calls=[tool_call]),
-            mock_llm_chunk(
-                content="I couldn't write that many todos.", finish_reason="stop"
-            ),
+            [mock_llm_chunk(content="Let me write todos.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="I couldn't write that many todos.")],
         ]),
     )
 
@@ -383,7 +393,7 @@ async def test_tool_call_can_be_interrupted(
     exception_class: type[BaseException],
 ) -> None:
     tool_call = ToolCall(
-        id="call_8", function=FunctionCall(name="stub_tool", arguments="{}")
+        id="call_8", index=0, function=FunctionCall(name="stub_tool", arguments="{}")
     )
     config = VibeConfig(
         session_logging=SessionLoggingConfig(enabled=False),
@@ -392,10 +402,10 @@ async def test_tool_call_can_be_interrupted(
     )
     agent = Agent(
         config,
-        auto_approve=True,
+        mode=AgentMode.AUTO_APPROVE,
         backend=FakeBackend([
-            mock_llm_chunk(content="Let me use the tool.", tool_calls=[tool_call]),
-            mock_llm_chunk(content="Tool execution completed.", finish_reason="stop"),
+            [mock_llm_chunk(content="Let me use the tool.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="Tool execution completed.")],
         ]),
     )
     # no dependency injection available => monkey patch
@@ -421,16 +431,12 @@ async def test_tool_call_can_be_interrupted(
 async def test_fill_missing_tool_responses_inserts_placeholders() -> None:
     agent = Agent(
         make_config(),
-        auto_approve=True,
-        backend=FakeBackend([mock_llm_chunk(content="ok", finish_reason="stop")]),
+        mode=AgentMode.AUTO_APPROVE,
+        backend=FakeBackend(mock_llm_chunk(content="ok")),
     )
     tool_calls_messages = [
-        ToolCall(
-            id="tc1", function=FunctionCall(name="todo", arguments='{"action": "read"}')
-        ),
-        ToolCall(
-            id="tc2", function=FunctionCall(name="todo", arguments='{"action": "read"}')
-        ),
+        make_todo_tool_call("tc1", index=0),
+        make_todo_tool_call("tc2", index=1),
     ]
     assistant_msg = LLMMessage(
         role=Role.assistant, content="Calling tools...", tool_calls=tool_calls_messages
@@ -461,8 +467,8 @@ async def test_fill_missing_tool_responses_inserts_placeholders() -> None:
 async def test_ensure_assistant_after_tool_appends_understood() -> None:
     agent = Agent(
         make_config(),
-        auto_approve=True,
-        backend=FakeBackend([mock_llm_chunk(content="ok", finish_reason="stop")]),
+        mode=AgentMode.AUTO_APPROVE,
+        backend=FakeBackend(mock_llm_chunk(content="ok")),
     )
     tool_msg = LLMMessage(
         role=Role.tool, tool_call_id="tc_z", name="todo", content="Done"
